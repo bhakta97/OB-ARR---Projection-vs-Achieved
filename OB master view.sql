@@ -1,0 +1,1314 @@
+-- OB Master View: Rocketlane project data enriched with OS billing, currency, market, and upsell info
+-- Co-authored with CoCo
+-- CREATE OR REPLACE VIEW KEKA_BRAIN.RAW.VW_OB_MASTER AS
+-- To deploy: uncomment the line above and run with a role that has CREATE VIEW on KEKA_BRAIN.RAW
+-- e.g., USE ROLE SYSADMIN; or USE ROLE KEKA_BRAIN_ADMIN;
+WITH rl_status_map AS (
+    SELECT column1 AS STATUS_CODE, column2 AS PROJECT_STATUS FROM (VALUES
+        (2,  'In Progress'),
+        (3,  'Completed'),
+        (4,  'Blocked'),
+        (5,  'Proposed'),
+        (6,  'In Planning'),
+        (7,  'To be Staffed'),
+        (8,  'Cancelled'),
+        (9,  'On Hold'),
+        (10, 'In Progress - SOW'),
+        (11, 'In Progress - Setup'),
+        (12, 'In Progress - Sign off'),
+        (13, 'In Progress - Kick Off'),
+        (14, 'On Hold - SOW'),
+        (15, 'On Hold - Setup'),
+        (16, 'On Hold - Kick off'),
+        (17, 'On Hold - Sign off')
+    )
+),
+rl_users AS (
+    SELECT USER_ID, MIN(USER_NAME) AS USER_NAME
+    FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_USERS_10953
+    GROUP BY USER_ID
+),
+rl_projects_raw AS (
+    SELECT
+        p.PROJECT_ID,
+        p.PROJECT_NAME,
+        p.DUE_DATE,
+        p.DUE_DATE_ACTUAL,
+        p.START_DATE_ACTUAL,
+        p.CREATED_AT,
+        p.UPDATED_AT,
+        p.PROJECT_OWNER,
+        p.COMPANY_ID,
+        p.IS_DELETED,
+        p.IS_ARCHIVED,
+        TRY_PARSE_JSON(p.META_DATA) AS MD,
+        ROW_NUMBER() OVER (PARTITION BY p.PROJECT_ID ORDER BY p.UPDATED_AT DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_PROJECT_10953 p
+    WHERE p.META_DATA IS NOT NULL
+      AND p.META_DATA NOT LIKE '%__debezium%'
+),
+rl_projects AS (
+    SELECT * FROM rl_projects_raw
+    WHERE RN = 1
+      AND IS_DELETED = FALSE
+      AND NVL(IS_ARCHIVED, FALSE) = FALSE
+),
+rl_base AS (
+    SELECT
+        p.PROJECT_ID,
+        p.PROJECT_NAME,
+        DATEADD(DAY, DATE_PART(EPOCH_SECOND, p.DUE_DATE) - 19800, '1970-01-01'::DATE) AS DUE_DATE,
+        u_owner.USER_NAME AS PROJECT_OWNER,
+        CASE
+            WHEN p.DUE_DATE_ACTUAL IS NOT NULL AND p.DUE_DATE_ACTUAL != ''
+            THEN DATEADD(DAY, TRY_CAST(p.DUE_DATE_ACTUAL AS INT), '1970-01-01'::DATE)
+        END AS ACTUAL_COMPLETED_DATE,
+        CASE
+            WHEN p.MD['871478']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['871478']::VARCHAR)
+            WHEN p.MD['1392989']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1392989']::VARCHAR)
+            WHEN p.START_DATE_ACTUAL IS NOT NULL AND TRY_CAST(p.START_DATE_ACTUAL AS INT) IS NOT NULL
+            THEN DATEADD(DAY, TRY_CAST(p.START_DATE_ACTUAL AS INT), '1970-01-01'::DATE)
+        END AS ACTUAL_START_DATE,
+        CASE
+            WHEN p.MD['1415528']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1415528']::VARCHAR)
+        END AS FIRST_GO_LIVE_DATE,
+        p.MD['1184354']::INT AS DAYS_IN_IMPLEMENTATION_STAGE,
+        p.MD['2589551']::INT AS DAYS_IN_SOLUTIONING_STAGE,
+        p.MD['2277748']::INT AS DURATION_ON_HOLD_KICKOFF,
+        p.MD['2277749']::INT AS DURATION_ON_HOLD_SETUP,
+        p.MD['2277750']::INT AS DURATION_ON_HOLD_SOW,
+        p.MD['2277752']::INT AS DURATION_ON_HOLD_SIGNOFF,
+        p.MD['2280486']::INT AS ON_HOLD_TOTAL_DURATION,
+        p.MD['2280481']::VARCHAR AS ON_HOLD_PRIMARY_REASON,
+        p.MD['2280449']::VARCHAR AS ON_HOLD_REQUEST_STATUS,
+        p.MD['2555824']::INT AS ON_HOLD_STATUS_APPROVED_COUNT,
+        DATEDIFF(DAY,
+            CASE
+                WHEN p.MD['871478']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['871478']::VARCHAR)
+                WHEN p.MD['1392989']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1392989']::VARCHAR)
+                WHEN p.START_DATE_ACTUAL IS NOT NULL AND TRY_CAST(p.START_DATE_ACTUAL AS INT) IS NOT NULL
+                THEN DATEADD(DAY, TRY_CAST(p.START_DATE_ACTUAL AS INT), '1970-01-01'::DATE)
+                ELSE p.CREATED_AT::DATE
+            END,
+            CASE
+                WHEN p.DUE_DATE_ACTUAL IS NOT NULL AND p.DUE_DATE_ACTUAL != ''
+                THEN DATEADD(DAY, TRY_CAST(p.DUE_DATE_ACTUAL AS INT), '1970-01-01'::DATE)
+                WHEN p.MD['1331172']::VARCHAR IS NOT NULL
+                THEN TRY_TO_DATE(p.MD['1331172']::VARCHAR)
+                ELSE CURRENT_DATE()
+            END
+        ) AS PROJECT_AGE,
+        p.CREATED_AT::DATE AS CREATED_ON,
+        CASE
+            WHEN p.MD['1331172']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1331172']::VARCHAR)
+        END AS CANCELLED_DATE,
+        CASE
+            WHEN p.MD['1612801']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1612801']::VARCHAR)
+        END AS ON_HOLD_DATE,
+        c.COMPANY_NAME AS CUSTOMER_NAME,
+        p.MD['531688']::VARCHAR AS SUBDOMAIN_NAME,
+        p.MD['1297427']::VARCHAR AS SUBSCRIPTION_ID,
+        p.MD['1324119']::VARCHAR AS CLIENT_ID,
+        COALESCE(
+            CASE p.MD['577166']::VARCHAR
+                WHEN '1' THEN 'SMB 1 (0-50)'
+                WHEN '2' THEN 'SMB 2 (51-100)'
+                WHEN '3' THEN 'MM 1 (101-250)'
+                WHEN '4' THEN 'MM 2 (251-500)'
+                WHEN '5' THEN 'ENT 1 (501-1000)'
+                WHEN '6' THEN 'ENT 2 (>1000)'
+                ELSE p.MD['577166']::VARCHAR
+            END,
+            CASE
+                WHEN p.MD['531726']::INT >  1000 THEN 'ENT 2 (>1000)'
+                WHEN p.MD['531726']::INT >=  501 THEN 'ENT 1 (501-1000)'
+                WHEN p.MD['531726']::INT >=  201 THEN 'MM 2 (201-500)'
+                WHEN p.MD['531726']::INT >=  101 THEN 'MM 1 (101-200)'
+                WHEN p.MD['531726']::INT >=   51 THEN 'SMB 2 (51-100)'
+                WHEN p.MD['531726']::INT >=    0 THEN 'SMB 1 (0-50)'
+            END
+        ) AS CUSTOMER_SEGMENT,
+        p.MD['531726']::INT AS EMPLOYEE_COUNT,
+        CASE p.MD['740594']::VARCHAR
+            WHEN '1' THEN 'Full Account - Sales'
+            WHEN '2' THEN 'Add On Account- Upsell'
+            WHEN '3' THEN 'Migration Account'
+            WHEN '4' THEN 'Reconfiguration Account'
+            WHEN '5' THEN 'Child Account'
+            WHEN '6' THEN 'Skipped Addon'
+            ELSE p.MD['740594']::VARCHAR
+        END AS TYPE_OF_ACCOUNT,
+        p.MD['645093']::VARCHAR AS SUBSCRIPTION_PLAN,
+        CASE
+            WHEN p.MD['1324117']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['1324117']::VARCHAR)
+        END AS TENANT_CREATED_ON,
+        p.MD['672854']::VARCHAR AS CSM_NAME,
+        u_sol.USER_NAME AS SOLUTION_POC,
+        CASE WHEN p.MD['1234603']::BOOLEAN = TRUE THEN 'Yes' ELSE 'No' END AS PARTNER_ACCOUNT,
+        p.MD['1231934']::VARCHAR AS PARTNER_NAME,
+        CASE p.MD['1415092']::VARCHAR
+            WHEN '1' THEN 'JSS Pro'
+            WHEN '2' THEN 'Savi 3'
+            WHEN '3' THEN 'One X'
+            WHEN '4' THEN 'Engineo'
+            WHEN '5' THEN 'Nuest'
+            ELSE p.MD['1415092']::VARCHAR
+        END AS PARTNER_ONB_ENG,
+        u_ob.USER_NAME AS ONBOARDING_ENGINEER,
+        p.MD['633090']::VARCHAR AS FEATURE,
+        ARRAY_TO_STRING(TRANSFORM(p.MD['527561']:value, v -> CASE v::INT
+            WHEN 1 THEN 'Core HR'
+            WHEN 2 THEN 'Timesheets'
+            WHEN 3 THEN 'PMS'
+            WHEN 4 THEN 'Payroll'
+            WHEN 5 THEN 'Leave'
+            WHEN 6 THEN 'Attendance'
+            WHEN 7 THEN 'Hiro'
+            WHEN 8 THEN 'Paygroup'
+            WHEN 9 THEN 'Helpdesk'
+            WHEN 10 THEN 'Keka API'
+            WHEN 11 THEN 'Assets'
+            WHEN 12 THEN 'Keka Learn'
+            WHEN 13 THEN 'R&R'
+            WHEN 14 THEN 'RnR'
+            ELSE v::VARCHAR
+        END), ', ') AS MODULE,
+        CASE
+            WHEN p.MD['531728']::VARCHAR IS NOT NULL THEN TRY_TO_DATE(p.MD['531728']::VARCHAR)
+        END AS PAYMENT_DATE,
+        CASE p.MD['1351974']::VARCHAR
+            WHEN '1' THEN '0-30'
+            WHEN '2' THEN '31-60'
+            WHEN '3' THEN '61-90'
+            WHEN '4' THEN '91-120'
+            WHEN '5' THEN '>120'
+            ELSE p.MD['1351974']::VARCHAR
+        END AS PROJECT_AGE_SEGMENT,
+        p.MD['1621019']::NUMBER AS CSAT_RATING,
+        p.MD['2276782']::NUMBER AS SOLUTIONING_CSAT,
+        p.MD['354534']::INT AS STATUS_CODE,
+        sm.PROJECT_STATUS AS PROJECT_STATUS,
+        CASE p.MD['1290897']::INT
+            WHEN 1 THEN 'India' WHEN 2 THEN 'US' WHEN 3 THEN 'MEA' WHEN 4 THEN 'ROW'
+        END AS REGION
+    FROM rl_projects p
+    LEFT JOIN rl_users u_owner ON p.PROJECT_OWNER = u_owner.USER_ID
+    LEFT JOIN rl_users u_sol ON p.MD['675591']::INT = u_sol.USER_ID
+    LEFT JOIN rl_users u_ob ON p.MD['675592']::INT = u_ob.USER_ID
+    LEFT JOIN (
+        SELECT COMPANY_ID, MIN(COMPANY_NAME) AS COMPANY_NAME
+        FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_COMPANY_10953
+        WHERE IS_DELETED = FALSE
+        GROUP BY COMPANY_ID
+    ) c ON p.COMPANY_ID = c.COMPANY_ID
+    LEFT JOIN rl_status_map sm ON p.MD['354534']::INT = sm.STATUS_CODE
+),
+os_org AS (
+    SELECT
+        SUBDOMAINNAME,
+        CLIENT_CODE,
+        SUBSCRIPTIONID,
+        ORGNAME,
+        MRR AS OS_MRR,
+        ACTIVEMRR,
+        ROW_NUMBER() OVER (PARTITION BY SUBDOMAINNAME ORDER BY ORGCREATEDON DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+),
+os_org_deduped AS (
+    SELECT * FROM os_org WHERE RN = 1
+),
+client_by_billing_name AS (
+    -- Derive CLIENT_CODE from billing account name when VW_ORGDETAILS doesn't have the customer.
+    -- CLIENT_CODE follows the convention: 'K' || LPAD(BA.ID, 5, '0').
+    -- Restricted to unambiguous (single billing account per name) to avoid wrong attribution.
+    SELECT UPPER(TRIM(NAME)) AS BA_NAME_KEY,
+           MIN('K' || LPAD(ID, 5, '0')) AS CLIENT_CODE
+    FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT
+    WHERE NVL(ISDELETED, FALSE) = FALSE
+      AND NAME IS NOT NULL
+      AND TRIM(NAME) <> ''
+    GROUP BY UPPER(TRIM(NAME))
+    HAVING COUNT(DISTINCT ID) = 1
+),
+subscription_by_billing_name AS (
+    -- Map BA name -> single subscription (preferring Active, then most recent).
+    -- Used as a final fallback when project has no subscription_id and no subdomain match.
+    SELECT BA_NAME_KEY, SUBSCRIPTIONID
+    FROM (
+        SELECT UPPER(TRIM(ba.NAME)) AS BA_NAME_KEY,
+               vs.SUBSCRIPTIONID,
+               ROW_NUMBER() OVER (
+                   PARTITION BY UPPER(TRIM(ba.NAME))
+                   ORDER BY CASE vs.STATUS WHEN 0 THEN 0 WHEN 1 THEN 1 WHEN 3 THEN 2 ELSE 3 END,
+                            vs.UPDATEDON DESC NULLS LAST
+               ) AS RN
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        JOIN KEKA_BRAIN.RAW.VW_SUBSCRIPTION vs
+            ON ba.BILLINGACCOUNTID = vs.BILLINGACCOUNTIDENTIFIER
+        WHERE NVL(ba.ISDELETED, FALSE) = FALSE
+          AND NVL(vs.ISDELETED, FALSE) = FALSE
+          AND ba.NAME IS NOT NULL AND TRIM(ba.NAME) <> ''
+          AND UPPER(TRIM(ba.NAME)) IN (SELECT BA_NAME_KEY FROM client_by_billing_name)
+    )
+    WHERE RN = 1
+),
+os_org_tenant_count AS (
+    -- Count distinct OS tenants (subdomains) per customer name.
+    -- Used to gate name-based subscription-ID backfill: only safe when count = 1.
+    SELECT UPPER(TRIM(ORGNAME)) AS ORGNAME_KEY,
+           COUNT(DISTINCT SUBDOMAINNAME) AS TENANT_COUNT
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+    WHERE ORGNAME IS NOT NULL AND TRIM(ORGNAME) <> ''
+    GROUP BY UPPER(TRIM(ORGNAME))
+),
+os_billing_account AS (
+    SELECT
+        ba.ID AS BILLINGACCOUNTID,
+        ba.BILLINGACCOUNTID AS BILLINGACCOUNTID_UUID,
+        ba.NAME AS BILLING_ACCOUNT_NAME,
+        PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR AS CURRENCY,
+        ROW_NUMBER() OVER (PARTITION BY ba.ID ORDER BY ba.UPDATEDON DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+    WHERE NVL(ba.ISDELETED, FALSE) = FALSE
+),
+os_billing_account_deduped AS (
+    SELECT * FROM os_billing_account WHERE RN = 1
+),
+os_subscription_tenant AS (
+    SELECT
+        SUBSCRIPTIONIDENTIFIER,
+        SUBDOMAINNAME,
+        BILLINGACCOUNTID,
+        ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONIDENTIFIER ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT
+),
+os_sub_tenant_deduped AS (
+    SELECT * FROM os_subscription_tenant WHERE RN = 1
+),
+os_active_sub AS (
+    SELECT
+        SUBSCRIPTION_IDENTIFIER,
+        BILLING_ACCOUNT_NAME AS OS_BILLING_ACCOUNT_NAME,
+        MRR AS ACTIVE_MRR,
+        BILLING_ACCOUNT_ID,
+        ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTION_IDENTIFIER ORDER BY LATEST_INVOICE_GENERATION_DATE DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.VW_OS_ACTIVE_SUBSCRIPTION_DETAILS
+),
+os_active_sub_deduped AS (
+    SELECT * FROM os_active_sub WHERE RN = 1
+),
+step2_backfill AS (
+    SELECT
+        rb.*,
+        COALESCE(rb.CLIENT_ID, os_org_by_subdomain.CLIENT_CODE, os_org_by_name.CLIENT_CODE, cbb.CLIENT_CODE) AS CLIENT_ID_RESOLVED,
+        COALESCE(
+            rb.SUBSCRIPTION_ID,
+            os_sub_by_subdomain.SUBSCRIPTIONIDENTIFIER,
+            CASE WHEN tc.TENANT_COUNT = 1 THEN os_org_by_name2.SUBSCRIPTIONID END,
+            sbb.SUBSCRIPTIONID
+        ) AS SUBSCRIPTION_ID_RESOLVED,
+        CASE
+            WHEN rb.SUBSCRIPTION_ID IS NOT NULL AND os_sub_by_subdomain_check.SUBSCRIPTIONIDENTIFIER IS NOT NULL
+                 AND UPPER(TRIM(rb.SUBSCRIPTION_ID)) != UPPER(TRIM(os_sub_by_subdomain_check.SUBSCRIPTIONIDENTIFIER))
+            THEN os_sub_by_subdomain_check.SUBSCRIPTIONIDENTIFIER
+        END AS SUBSCRIPTION_ID_MATCH_FOUND
+    FROM rl_base rb
+    LEFT JOIN os_org_deduped os_org_by_subdomain
+        ON rb.CLIENT_ID IS NULL
+        AND rb.SUBDOMAIN_NAME IS NOT NULL
+        AND TRIM(rb.SUBDOMAIN_NAME) <> ''
+        AND LOWER(TRIM(rb.SUBDOMAIN_NAME)) = LOWER(TRIM(os_org_by_subdomain.SUBDOMAINNAME))
+    LEFT JOIN (
+        SELECT ORGNAME_KEY, CLIENT_CODE
+        FROM (
+            SELECT UPPER(TRIM(o.ORGNAME)) AS ORGNAME_KEY, o.CLIENT_CODE,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY UPPER(TRIM(o.ORGNAME))
+                       ORDER BY CASE vs.STATUS WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE 2 END,
+                                vs.UPDATEDON DESC NULLS LAST
+                   ) AS RN
+            FROM os_org_deduped o
+            LEFT JOIN (
+                SELECT SUBSCRIPTIONID, STATUS, UPDATEDON,
+                       ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS SRN
+                FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION WHERE NVL(ISDELETED, FALSE) = FALSE
+            ) vs ON o.SUBSCRIPTIONID = vs.SUBSCRIPTIONID AND vs.SRN = 1
+            WHERE o.ORGNAME IS NOT NULL AND TRIM(o.ORGNAME) <> ''
+              AND o.CLIENT_CODE IS NOT NULL AND TRIM(o.CLIENT_CODE) <> ''
+              AND vs.STATUS = 0
+        )
+        WHERE RN = 1
+    ) os_org_by_name
+        ON rb.CLIENT_ID IS NULL
+        AND os_org_by_subdomain.CLIENT_CODE IS NULL
+        AND UPPER(TRIM(rb.CUSTOMER_NAME)) = os_org_by_name.ORGNAME_KEY
+    LEFT JOIN client_by_billing_name cbb
+        ON rb.CLIENT_ID IS NULL
+        AND os_org_by_subdomain.CLIENT_CODE IS NULL
+        AND os_org_by_name.CLIENT_CODE IS NULL
+        AND UPPER(TRIM(rb.CUSTOMER_NAME)) = cbb.BA_NAME_KEY
+    LEFT JOIN (
+        SELECT SUBDOMAINNAME, SUBSCRIPTIONIDENTIFIER, BILLINGACCOUNTID
+        FROM (
+            SELECT bst.SUBDOMAINNAME, bst.SUBSCRIPTIONIDENTIFIER, bst.BILLINGACCOUNTID,
+                   ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(bst.SUBDOMAINNAME))
+                       ORDER BY CASE vs.STATUS WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE 2 END,
+                                bst.UPDATEDON DESC NULLS LAST) AS SDN_RN
+            FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT bst
+            LEFT JOIN (
+                SELECT SUBSCRIPTIONID, STATUS,
+                       ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+                FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION WHERE NVL(ISDELETED, FALSE) = FALSE
+            ) vs ON bst.SUBSCRIPTIONIDENTIFIER = vs.SUBSCRIPTIONID AND vs.RN = 1
+        )
+        WHERE SDN_RN = 1
+    ) os_sub_by_subdomain
+        ON rb.SUBSCRIPTION_ID IS NULL
+        AND rb.SUBDOMAIN_NAME IS NOT NULL
+        AND LOWER(TRIM(rb.SUBDOMAIN_NAME)) = LOWER(TRIM(os_sub_by_subdomain.SUBDOMAINNAME))
+    LEFT JOIN (
+        SELECT ORGNAME_KEY, SUBSCRIPTIONID
+        FROM (
+            SELECT UPPER(TRIM(o.ORGNAME)) AS ORGNAME_KEY, o.SUBSCRIPTIONID,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY UPPER(TRIM(o.ORGNAME))
+                       ORDER BY vs.UPDATEDON DESC NULLS LAST
+                   ) AS RN
+            FROM os_org_deduped o
+            LEFT JOIN (
+                SELECT SUBSCRIPTIONID, STATUS, UPDATEDON,
+                       ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS SRN
+                FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION WHERE NVL(ISDELETED, FALSE) = FALSE
+            ) vs ON o.SUBSCRIPTIONID = vs.SUBSCRIPTIONID AND vs.SRN = 1
+            WHERE o.ORGNAME IS NOT NULL AND TRIM(o.ORGNAME) <> ''
+              AND o.SUBSCRIPTIONID IS NOT NULL AND TRIM(o.SUBSCRIPTIONID) <> ''
+              AND vs.STATUS = 0
+        )
+        WHERE RN = 1
+    ) os_org_by_name2
+        ON rb.SUBSCRIPTION_ID IS NULL
+        AND os_sub_by_subdomain.SUBSCRIPTIONIDENTIFIER IS NULL
+        AND UPPER(TRIM(rb.CUSTOMER_NAME)) = os_org_by_name2.ORGNAME_KEY
+    LEFT JOIN os_org_tenant_count tc
+        ON UPPER(TRIM(rb.CUSTOMER_NAME)) = tc.ORGNAME_KEY
+        AND tc.TENANT_COUNT = 1
+    LEFT JOIN subscription_by_billing_name sbb
+        ON rb.SUBSCRIPTION_ID IS NULL
+        AND os_sub_by_subdomain.SUBSCRIPTIONIDENTIFIER IS NULL
+        AND (tc.TENANT_COUNT IS NULL OR tc.TENANT_COUNT <> 1 OR os_org_by_name2.SUBSCRIPTIONID IS NULL)
+        AND UPPER(TRIM(rb.CUSTOMER_NAME)) = sbb.BA_NAME_KEY
+    LEFT JOIN (
+        SELECT SUBDOMAINNAME, SUBSCRIPTIONIDENTIFIER
+        FROM (
+            SELECT bst.SUBDOMAINNAME, bst.SUBSCRIPTIONIDENTIFIER,
+                   ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(bst.SUBDOMAINNAME))
+                       ORDER BY CASE vs.STATUS WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE 2 END,
+                                bst.UPDATEDON DESC NULLS LAST) AS SDN_RN
+            FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT bst
+            LEFT JOIN (
+                SELECT SUBSCRIPTIONID, STATUS,
+                       ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+                FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION WHERE NVL(ISDELETED, FALSE) = FALSE
+            ) vs ON bst.SUBSCRIPTIONIDENTIFIER = vs.SUBSCRIPTIONID AND vs.RN = 1
+        )
+        WHERE SDN_RN = 1
+    ) os_sub_by_subdomain_check
+        ON rb.SUBSCRIPTION_ID IS NOT NULL
+        AND rb.SUBDOMAIN_NAME IS NOT NULL
+        AND LOWER(TRIM(rb.SUBDOMAIN_NAME)) = LOWER(TRIM(os_sub_by_subdomain_check.SUBDOMAINNAME))
+),
+currency_base AS (
+    -- Path A: VW_ORGDETAILS -> subscription tenant -> billing account.
+    SELECT
+        UPPER(TRIM(o.CLIENT_CODE))    AS CLIENT_CODE_KEY,
+        LOWER(TRIM(o.SUBDOMAINNAME))  AS SUBDOMAIN_KEY,
+        UPPER(TRIM(o.ORGNAME))        AS ORGNAME_KEY,
+        TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR AS CURRENCY
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS o
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT bst
+        ON o.SUBSCRIPTIONID = bst.SUBSCRIPTIONIDENTIFIER
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON bst.BILLINGACCOUNTID = ba.ID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    WHERE ba.BILLINGCURRENCY IS NOT NULL
+      AND TRIM(ba.BILLINGCURRENCY) <> ''
+    UNION ALL
+    -- Path B: direct from billing account using CLIENT_CODE = 'K' || LPAD(BA.ID, 5, '0').
+    -- Catches tenants present in OS_BIZ_BILLINGACCOUNT but missing from VW_ORGDETAILS.
+    SELECT
+        'K' || LPAD(ba.ID, 5, '0')                       AS CLIENT_CODE_KEY,
+        NULL                                              AS SUBDOMAIN_KEY,
+        UPPER(TRIM(ba.NAME))                              AS ORGNAME_KEY,
+        TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR  AS CURRENCY
+    FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+    WHERE NVL(ba.ISDELETED, FALSE) = FALSE
+      AND ba.BILLINGCURRENCY IS NOT NULL
+      AND TRIM(ba.BILLINGCURRENCY) <> ''
+),
+currency_by_client AS (
+    SELECT CLIENT_CODE_KEY, MIN(CURRENCY) AS CURRENCY
+    FROM currency_base
+    WHERE CLIENT_CODE_KEY IS NOT NULL AND CLIENT_CODE_KEY <> ''
+    GROUP BY CLIENT_CODE_KEY
+    HAVING COUNT(DISTINCT CURRENCY) = 1
+),
+currency_by_subdomain AS (
+    SELECT SUBDOMAIN_KEY, MIN(CURRENCY) AS CURRENCY
+    FROM currency_base
+    WHERE SUBDOMAIN_KEY IS NOT NULL AND SUBDOMAIN_KEY <> ''
+    GROUP BY SUBDOMAIN_KEY
+    HAVING COUNT(DISTINCT CURRENCY) = 1
+),
+currency_by_orgname AS (
+    SELECT ORGNAME_KEY, MIN(CURRENCY) AS CURRENCY
+    FROM currency_base
+    WHERE ORGNAME_KEY IS NOT NULL AND ORGNAME_KEY <> ''
+    GROUP BY ORGNAME_KEY
+    HAVING COUNT(DISTINCT CURRENCY) = 1
+),
+currency_by_active_sub AS (
+    -- Fallback path: derive currency via active-subscription -> billing account.
+    -- Catches tenants present in VW_OS_ACTIVE_SUBSCRIPTION_DETAILS but missing from VW_ORGDETAILS / OS_BIZ_BILLINGSUBSCRIPTIONTENANT.
+    SELECT UPPER(TRIM(asd.SUBSCRIPTION_IDENTIFIER)) AS SUBSCRIPTION_KEY,
+           TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR AS CURRENCY
+    FROM (
+        SELECT SUBSCRIPTION_IDENTIFIER, BILLING_ACCOUNT_ID,
+               ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTION_IDENTIFIER
+                                  ORDER BY LATEST_INVOICE_GENERATION_DATE DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_OS_ACTIVE_SUBSCRIPTION_DETAILS
+    ) asd
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON asd.BILLING_ACCOUNT_ID = ba.ID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    WHERE asd.RN = 1
+      AND ba.BILLINGCURRENCY IS NOT NULL
+      AND TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR IS NOT NULL
+),
+currency_by_any_sub AS (
+    -- Final fallback: covers suspended/inactive subscriptions via VW_SUBSCRIPTION.
+    SELECT UPPER(TRIM(vs.SUBSCRIPTIONID)) AS SUBSCRIPTION_KEY,
+           TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR AS CURRENCY
+    FROM (
+        SELECT SUBSCRIPTIONID, BILLINGACCOUNTIDENTIFIER,
+               ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION
+        WHERE NVL(ISDELETED, FALSE) = FALSE
+    ) vs
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON vs.BILLINGACCOUNTIDENTIFIER = ba.BILLINGACCOUNTID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    WHERE vs.RN = 1
+      AND ba.BILLINGCURRENCY IS NOT NULL
+      AND TRY_PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR IS NOT NULL
+),
+market_by_client AS (
+    -- Derive Market from OS using CLIENT_CODE.
+    -- Returns NULL if a CLIENT_CODE has multiple distinct markets (ambiguous).
+    -- Source A: VW_ORGDETAILS.PRIMARYMARKETNAME by CLIENT_CODE.
+    -- Source B: 'K' || LPAD(BA.ID,5,'0') -> OS_BIZ_BILLINGACCOUNT.MARKETID -> OS_BIZ_MARKET.NAME.
+    SELECT CLIENT_CODE_KEY, MIN(MARKET) AS MARKET
+    FROM (
+        SELECT UPPER(TRIM(CLIENT_CODE)) AS CLIENT_CODE_KEY,
+               PRIMARYMARKETNAME        AS MARKET
+        FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+        WHERE CLIENT_CODE IS NOT NULL
+          AND TRIM(CLIENT_CODE) <> ''
+          AND PRIMARYMARKETNAME IS NOT NULL
+          AND TRIM(PRIMARYMARKETNAME) <> ''
+        UNION ALL
+        SELECT 'K' || LPAD(ba.ID, 5, '0') AS CLIENT_CODE_KEY,
+               m.NAME                     AS MARKET
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_MARKET m ON ba.MARKETID = m.ID
+        WHERE NVL(ba.ISDELETED, FALSE) = FALSE
+          AND m.NAME IS NOT NULL
+    )
+    GROUP BY CLIENT_CODE_KEY
+    HAVING COUNT(DISTINCT MARKET) = 1
+),
+market_by_subscription AS (
+    SELECT UPPER(TRIM(SUBSCRIPTIONID)) AS SUBSCRIPTION_KEY,
+           MIN(PRIMARYMARKETNAME) AS MARKET
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+    WHERE SUBSCRIPTIONID IS NOT NULL
+      AND TRIM(SUBSCRIPTIONID) <> ''
+      AND PRIMARYMARKETNAME IS NOT NULL
+      AND TRIM(PRIMARYMARKETNAME) <> ''
+    GROUP BY UPPER(TRIM(SUBSCRIPTIONID))
+    HAVING COUNT(DISTINCT PRIMARYMARKETNAME) = 1
+),
+market_by_subdomain AS (
+    SELECT LOWER(TRIM(SUBDOMAINNAME)) AS SUBDOMAIN_KEY,
+           MIN(PRIMARYMARKETNAME) AS MARKET
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+    WHERE SUBDOMAINNAME IS NOT NULL
+      AND TRIM(SUBDOMAINNAME) <> ''
+      AND PRIMARYMARKETNAME IS NOT NULL
+      AND TRIM(PRIMARYMARKETNAME) <> ''
+    GROUP BY LOWER(TRIM(SUBDOMAINNAME))
+    HAVING COUNT(DISTINCT PRIMARYMARKETNAME) = 1
+),
+market_by_orgname AS (
+    SELECT UPPER(TRIM(ORGNAME)) AS ORGNAME_KEY,
+           MIN(PRIMARYMARKETNAME) AS MARKET
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+    WHERE ORGNAME IS NOT NULL
+      AND TRIM(ORGNAME) <> ''
+      AND PRIMARYMARKETNAME IS NOT NULL
+      AND TRIM(PRIMARYMARKETNAME) <> ''
+    GROUP BY UPPER(TRIM(ORGNAME))
+    HAVING COUNT(DISTINCT PRIMARYMARKETNAME) = 1
+),
+market_by_active_sub AS (
+    -- Fallback path: derive market via active-subscription -> billing account -> market.
+    SELECT UPPER(TRIM(asd.SUBSCRIPTION_IDENTIFIER)) AS SUBSCRIPTION_KEY,
+           m.NAME AS MARKET
+    FROM (
+        SELECT SUBSCRIPTION_IDENTIFIER, BILLING_ACCOUNT_ID,
+               ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTION_IDENTIFIER
+                                  ORDER BY LATEST_INVOICE_GENERATION_DATE DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_OS_ACTIVE_SUBSCRIPTION_DETAILS
+    ) asd
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON asd.BILLING_ACCOUNT_ID = ba.ID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_MARKET m ON ba.MARKETID = m.ID
+    WHERE asd.RN = 1
+      AND m.NAME IS NOT NULL
+),
+market_by_any_sub AS (
+    -- Final fallback: covers suspended/inactive subscriptions via VW_SUBSCRIPTION.
+    SELECT UPPER(TRIM(vs.SUBSCRIPTIONID)) AS SUBSCRIPTION_KEY,
+           m.NAME AS MARKET
+    FROM (
+        SELECT SUBSCRIPTIONID, BILLINGACCOUNTIDENTIFIER,
+               ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION
+        WHERE NVL(ISDELETED, FALSE) = FALSE
+    ) vs
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON vs.BILLINGACCOUNTIDENTIFIER = ba.BILLINGACCOUNTID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_MARKET m ON ba.MARKETID = m.ID
+    WHERE vs.RN = 1
+      AND m.NAME IS NOT NULL
+),
+mrr_by_any_sub AS (
+    -- Pull MRR for any subscription (active, suspended, draft) from VW_SUBSCRIPTION.
+    -- Used as final fallback when ACTIVE_MRR / org-details MRR is unavailable
+    -- (e.g., suspended tenants not present in VW_OS_ACTIVE_SUBSCRIPTION_DETAILS).
+    SELECT SUBSCRIPTION_KEY, MRR
+    FROM (
+        SELECT UPPER(TRIM(SUBSCRIPTIONID)) AS SUBSCRIPTION_KEY,
+               COALESCE(MRR, ACTIVEMRR) AS MRR,
+               ROW_NUMBER() OVER (PARTITION BY SUBSCRIPTIONID ORDER BY UPDATEDON DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION
+        WHERE NVL(ISDELETED, FALSE) = FALSE
+          AND COALESCE(MRR, ACTIVEMRR) IS NOT NULL
+    )
+    WHERE RN = 1
+),
+tenant_status_lookup AS (
+    -- Tenant subscription status keyed on subscription id.
+    -- OS (VW_SUBSCRIPTION.STATUS) is the AUTHORITY:
+    --   0 -> Active, 1 -> Suspended, 3 -> Draft (no start/end dates observed).
+    -- Falls back to HubSpot textual status (PROPERTY_SUBSCRIPTION_STATUS)
+    -- only when OS status is missing/unmapped.
+    SELECT
+        UPPER(TRIM(s.SUBSCRIPTION_ID)) AS SUBSCRIPTION_KEY,
+        COALESCE(
+            CASE s.OS_STATUS
+                WHEN 0 THEN 'Active'
+                WHEN 1 THEN 'Suspended'
+                WHEN 3 THEN 'Draft'
+            END,
+            CASE
+                WHEN UPPER(TRIM(s.HS_STATUS)) IN ('ACTIVE')              THEN 'Active'
+                WHEN UPPER(TRIM(s.HS_STATUS)) IN ('ACCESS BLOCKED')      THEN 'Suspended'
+                WHEN UPPER(TRIM(s.HS_STATUS)) IN ('EXPIRED')             THEN 'Expired'
+                WHEN UPPER(TRIM(s.HS_STATUS)) IN ('ABOUT TO EXPIRE')     THEN 'About to Expire'
+                WHEN s.HS_STATUS IS NOT NULL AND TRIM(s.HS_STATUS) <> '' THEN INITCAP(s.HS_STATUS)
+            END
+        ) AS TENANT_STATUS
+    FROM (
+        SELECT
+            vs.SUBSCRIPTIONID                  AS SUBSCRIPTION_ID,
+            vs.STATUS                          AS OS_STATUS,
+            hs.PROPERTY_SUBSCRIPTION_STATUS    AS HS_STATUS,
+            ROW_NUMBER() OVER (PARTITION BY vs.SUBSCRIPTIONID
+                               ORDER BY vs.UPDATEDON DESC NULLS LAST) AS RN
+        FROM KEKA_BRAIN.RAW.VW_SUBSCRIPTION vs
+        LEFT JOIN KEKA_BRAIN.RAW.VW_HS_OS_TENANTS hs
+            ON vs.SUBSCRIPTIONID = hs.PROPERTY_SUBSCRIPTION_ID
+        WHERE NVL(vs.ISDELETED, FALSE) = FALSE
+    ) s
+    WHERE s.RN = 1
+),
+os_item_completion AS (
+    SELECT TENANTID, MAX(COMPLETEDON)::DATE AS ITEM_COMPLETION_DATE
+    FROM KEKA_BRAIN.RAW.OS_BIZ_TENANTONBOARDINGITEM
+    WHERE ISCOMPLETED = TRUE AND COMPLETEDON IS NOT NULL
+    GROUP BY TENANTID
+),
+os_ob_completion_unified AS (
+    SELECT
+        org.SUBSCRIPTIONID,
+        org.SUBDOMAINNAME,
+        COALESCE(org.ONBOARDCOMPLETEDON::DATE, oic.ITEM_COMPLETION_DATE) AS OS_OB_COMPLETION_DATE
+    FROM KEKA_BRAIN.RAW.VW_ORGDETAILS org
+    LEFT JOIN os_item_completion oic ON org.TENANTID = oic.TENANTID
+),
+os_ob_completion_by_sub AS (
+    SELECT SUBSCRIPTION_KEY, OS_OB_COMPLETION_DATE FROM (
+        SELECT
+            UPPER(TRIM(SUBSCRIPTIONID)) AS SUBSCRIPTION_KEY,
+            OS_OB_COMPLETION_DATE,
+            ROW_NUMBER() OVER (
+                PARTITION BY UPPER(TRIM(SUBSCRIPTIONID))
+                ORDER BY OS_OB_COMPLETION_DATE DESC NULLS LAST
+            ) AS RN
+        FROM os_ob_completion_unified
+        WHERE SUBSCRIPTIONID IS NOT NULL
+          AND TRIM(SUBSCRIPTIONID) <> ''
+          AND OS_OB_COMPLETION_DATE IS NOT NULL
+    ) WHERE RN = 1
+),
+os_ob_completion_by_subdomain AS (
+    SELECT
+        LOWER(TRIM(SUBDOMAINNAME)) AS SUBDOMAIN_KEY,
+        MAX(OS_OB_COMPLETION_DATE) AS OS_OB_COMPLETION_DATE
+    FROM os_ob_completion_unified
+    WHERE SUBDOMAINNAME IS NOT NULL
+      AND TRIM(SUBDOMAINNAME) <> ''
+      AND OS_OB_COMPLETION_DATE IS NOT NULL
+    GROUP BY LOWER(TRIM(SUBDOMAINNAME))
+),
+step3_enrichment AS (
+    SELECT
+        s2.*,
+        COALESCE(NULLIF(TRIM(s2.SUBDOMAIN_NAME), ''), st_resolved.SUBDOMAINNAME) AS SUBDOMAIN_NAME_RESOLVED,
+        COALESCE(
+            ba_by_sub.BILLING_ACCOUNT_NAME,
+            oas.OS_BILLING_ACCOUNT_NAME,
+            ba_by_name.BILLING_ACCOUNT_NAME
+        ) AS BILLING_ACCOUNT_NAME,
+        COALESCE(
+            oas.ACTIVE_MRR,
+            os_mrr_by_subdomain.OS_MRR,
+            os_mrr_by_name.OS_MRR,
+            mbany_mrr.MRR
+        ) AS MRR_FULL_ACCOUNT,
+        COALESCE(cbc.CURRENCY, cbs.CURRENCY, cbo.CURRENCY, cbas.CURRENCY, cbany.CURRENCY) AS CURRENCY,
+        COALESCE(mbc.MARKET, mbsub.MARKET, mbs.MARKET, mbo.MARKET, mbas.MARKET, mbany.MARKET) AS MARKET,
+        tsl.TENANT_STATUS AS TENANT_STATUS,
+        COALESCE(os_ob_comp_sub.OS_OB_COMPLETION_DATE, os_ob_comp_subdomain.OS_OB_COMPLETION_DATE) AS OS_OB_COMPLETION_DATE
+    FROM step2_backfill s2
+    LEFT JOIN os_sub_tenant_deduped st_resolved
+        ON COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID_MATCH_FOUND) = st_resolved.SUBSCRIPTIONIDENTIFIER
+    LEFT JOIN os_billing_account_deduped ba_by_sub
+        ON st_resolved.BILLINGACCOUNTID = ba_by_sub.BILLINGACCOUNTID
+    LEFT JOIN os_active_sub_deduped oas
+        ON COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID_MATCH_FOUND) = oas.SUBSCRIPTION_IDENTIFIER
+    LEFT JOIN os_org_deduped os_mrr_by_subdomain
+        ON s2.SUBDOMAIN_NAME IS NOT NULL
+        AND LOWER(TRIM(s2.SUBDOMAIN_NAME)) = LOWER(TRIM(os_mrr_by_subdomain.SUBDOMAINNAME))
+        AND oas.ACTIVE_MRR IS NULL
+    LEFT JOIN (
+        SELECT UPPER(TRIM(ORGNAME)) AS ORGNAME_KEY, MAX(COALESCE(OS_MRR, ACTIVEMRR)) AS OS_MRR
+        FROM os_org_deduped
+        WHERE ORGNAME IS NOT NULL AND TRIM(ORGNAME) <> ''
+          AND COALESCE(OS_MRR, ACTIVEMRR) IS NOT NULL
+        GROUP BY UPPER(TRIM(ORGNAME))
+    ) os_mrr_by_name
+        ON oas.ACTIVE_MRR IS NULL
+        AND os_mrr_by_subdomain.OS_MRR IS NULL
+        AND UPPER(TRIM(s2.CUSTOMER_NAME)) = os_mrr_by_name.ORGNAME_KEY
+    LEFT JOIN (
+        SELECT UPPER(TRIM(BILLING_ACCOUNT_NAME)) AS BA_NAME_KEY,
+               MIN(BILLING_ACCOUNT_NAME) AS BILLING_ACCOUNT_NAME
+        FROM os_billing_account_deduped
+        WHERE BILLING_ACCOUNT_NAME IS NOT NULL AND TRIM(BILLING_ACCOUNT_NAME) <> ''
+        GROUP BY UPPER(TRIM(BILLING_ACCOUNT_NAME))
+        HAVING COUNT(*) = 1
+    ) ba_by_name
+        ON ba_by_sub.BILLING_ACCOUNT_NAME IS NULL
+        AND oas.OS_BILLING_ACCOUNT_NAME IS NULL
+        AND st_resolved.BILLINGACCOUNTID IS NULL
+        AND UPPER(TRIM(s2.CUSTOMER_NAME)) = ba_by_name.BA_NAME_KEY
+    LEFT JOIN currency_by_client cbc
+        ON UPPER(TRIM(COALESCE(s2.CLIENT_ID_RESOLVED, s2.CLIENT_ID))) = cbc.CLIENT_CODE_KEY
+    LEFT JOIN currency_by_subdomain cbs
+        ON cbc.CURRENCY IS NULL
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s2.SUBDOMAIN_NAME), ''), st_resolved.SUBDOMAINNAME))) = cbs.SUBDOMAIN_KEY
+    LEFT JOIN currency_by_orgname cbo
+        ON cbc.CURRENCY IS NULL
+        AND cbs.CURRENCY IS NULL
+        AND UPPER(TRIM(s2.CUSTOMER_NAME)) = cbo.ORGNAME_KEY
+    LEFT JOIN currency_by_active_sub cbas
+        ON cbc.CURRENCY IS NULL
+        AND cbs.CURRENCY IS NULL
+        AND cbo.CURRENCY IS NULL
+        AND UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = cbas.SUBSCRIPTION_KEY
+    LEFT JOIN currency_by_any_sub cbany
+        ON cbc.CURRENCY IS NULL
+        AND cbs.CURRENCY IS NULL
+        AND cbo.CURRENCY IS NULL
+        AND cbas.CURRENCY IS NULL
+        AND UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = cbany.SUBSCRIPTION_KEY
+    LEFT JOIN market_by_client mbc
+        ON UPPER(TRIM(COALESCE(s2.CLIENT_ID_RESOLVED, s2.CLIENT_ID))) = mbc.CLIENT_CODE_KEY
+    LEFT JOIN market_by_subscription mbsub
+        ON mbc.MARKET IS NULL
+        AND UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = mbsub.SUBSCRIPTION_KEY
+    LEFT JOIN market_by_subdomain mbs
+        ON mbc.MARKET IS NULL
+        AND mbsub.MARKET IS NULL
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s2.SUBDOMAIN_NAME), ''), st_resolved.SUBDOMAINNAME))) = mbs.SUBDOMAIN_KEY
+    LEFT JOIN market_by_orgname mbo
+        ON mbc.MARKET IS NULL
+        AND mbsub.MARKET IS NULL
+        AND mbs.MARKET IS NULL
+        AND UPPER(TRIM(s2.CUSTOMER_NAME)) = mbo.ORGNAME_KEY
+    LEFT JOIN market_by_active_sub mbas
+        ON mbc.MARKET IS NULL
+        AND mbsub.MARKET IS NULL
+        AND mbs.MARKET IS NULL
+        AND mbo.MARKET IS NULL
+        AND UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = mbas.SUBSCRIPTION_KEY
+    LEFT JOIN market_by_any_sub mbany
+        ON mbc.MARKET IS NULL
+        AND mbsub.MARKET IS NULL
+        AND mbs.MARKET IS NULL
+        AND mbo.MARKET IS NULL
+        AND mbas.MARKET IS NULL
+        AND UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = mbany.SUBSCRIPTION_KEY
+    LEFT JOIN tenant_status_lookup tsl
+        ON UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = tsl.SUBSCRIPTION_KEY
+    LEFT JOIN mrr_by_any_sub mbany_mrr
+        ON UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = mbany_mrr.SUBSCRIPTION_KEY
+    LEFT JOIN os_ob_completion_by_sub os_ob_comp_sub
+        ON UPPER(TRIM(COALESCE(s2.SUBSCRIPTION_ID_RESOLVED, s2.SUBSCRIPTION_ID, s2.SUBSCRIPTION_ID_MATCH_FOUND))) = os_ob_comp_sub.SUBSCRIPTION_KEY
+    LEFT JOIN os_ob_completion_by_subdomain os_ob_comp_subdomain
+        ON os_ob_comp_sub.OS_OB_COMPLETION_DATE IS NULL
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s2.SUBDOMAIN_NAME), ''), st_resolved.SUBDOMAINNAME))) = os_ob_comp_subdomain.SUBDOMAIN_KEY
+),
+upsell_rl_module_options AS (
+    SELECT DISTINCT f.value:value::INT AS MODULE_ID,
+        CASE UPPER(REPLACE(f.value:label::VARCHAR, ' ', ''))
+            WHEN 'HIRO' THEN 'ATS' WHEN 'TIMESHEETS' THEN 'PSA'
+            WHEN 'KEKAAPI' THEN 'API' WHEN 'KEKALEARN' THEN 'LMS'
+            WHEN 'R&R' THEN 'RNR' WHEN 'RNR' THEN 'RNR'
+            WHEN 'PAYGROUP' THEN 'PAYGROUP'
+            ELSE UPPER(REPLACE(f.value:label::VARCHAR, ' ', ''))
+        END AS MODULE_ALIAS
+    FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_FIELD_10953,
+        LATERAL FLATTEN(input => TRY_PARSE_JSON(META_DATA):options) f
+    WHERE FIELD_NAME = 'Module_527561' AND META_DATA IS NOT NULL
+),
+upsell_rl_projects_ranked AS (
+    SELECT
+        p.PROJECT_ID, p.PROJECT_NAME, p.CREATED_AT, p.DUE_DATE, p.DUE_DATE_ACTUAL,
+        TRY_PARSE_JSON(p.META_DATA)['354534']::INT      AS STATUS_CODE,
+        TRY_PARSE_JSON(p.META_DATA)['740594']::VARCHAR   AS TYPE_OF_ACCOUNT,
+        TRY_PARSE_JSON(p.META_DATA)['1324119']::VARCHAR  AS CLIENT_CODE,
+        TRY_PARSE_JSON(p.META_DATA)['531688']::VARCHAR   AS SUBDOMAIN,
+        TRY_PARSE_JSON(p.META_DATA)['527561']             AS MODULE_RAW,
+        TRY_PARSE_JSON(p.META_DATA)['1331172']::VARCHAR  AS CANCELLED_DATE,
+        TRY_PARSE_JSON(p.META_DATA)['2070071']::VARCHAR  AS CANCEL_REASON_ID,
+        u.USER_NAME                                       AS PROJECT_OWNER_NAME,
+        p.IS_DELETED,
+        ROW_NUMBER() OVER (PARTITION BY p.PROJECT_ID ORDER BY p.UPDATED_AT DESC NULLS LAST) AS RN
+    FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_PROJECT_10953 p
+    LEFT JOIN (
+        SELECT USER_ID, MIN(USER_NAME) AS USER_NAME
+        FROM KEKA_BRAIN.RAW.VW_RL_PUBLIC_USERS_10953
+        GROUP BY USER_ID
+    ) u ON p.PROJECT_OWNER = u.USER_ID
+    WHERE p.META_DATA IS NOT NULL AND p.META_DATA NOT LIKE '%__debezium%'
+),
+upsell_rl_projects AS (
+    SELECT PROJECT_ID, PROJECT_NAME, CREATED_AT, DUE_DATE, DUE_DATE_ACTUAL,
+           STATUS_CODE, TYPE_OF_ACCOUNT, CLIENT_CODE, SUBDOMAIN, MODULE_RAW,
+           CANCELLED_DATE, CANCEL_REASON_ID, PROJECT_OWNER_NAME
+    FROM upsell_rl_projects_ranked
+    WHERE RN = 1
+      AND IS_DELETED = FALSE
+),
+upsell_rl_project_modules AS (
+    SELECT rp.PROJECT_ID, mo.MODULE_ALIAS
+    FROM upsell_rl_projects rp, LATERAL FLATTEN(input => rp.MODULE_RAW:value) mv
+    JOIN upsell_rl_module_options mo ON mv.value::INT = mo.MODULE_ID
+),
+upsell_quotation_addon_aliases AS (
+    SELECT DISTINCT q.QUOTATIONID,
+        CASE UPPER(REPLACE(REPLACE(REPLACE(TRIM(m.value::VARCHAR), ' ', ''), '-', ''), '/', ''))
+            WHEN 'TIMESHEET' THEN 'PSA' WHEN 'TIMESHEETS' THEN 'PSA'
+            WHEN 'PSAADVANCED' THEN 'PSA' WHEN 'PSAPRO' THEN 'PSA'
+            WHEN 'RECRUITMENT' THEN 'ATS' WHEN 'REQUISITION' THEN 'ATS'
+            WHEN 'HRIS' THEN 'COREHR' WHEN 'COREHR' THEN 'COREHR'
+            WHEN 'LMSKEKALEARN' THEN 'LMS' WHEN 'LEARN' THEN 'LMS' WHEN 'LMS' THEN 'LMS'
+            WHEN 'R_N_R' THEN 'RNR' WHEN 'RNR' THEN 'RNR' WHEN 'RANDR' THEN 'RNR'
+            WHEN 'PAYGROUP' THEN 'PAYGROUP' WHEN 'PAYGROUPS' THEN 'PAYGROUP'
+            WHEN 'PAYROLL' THEN 'PAYROLL' WHEN 'PAYROLLAUTOMATION' THEN 'PAYROLL'
+            WHEN 'PMS' THEN 'PMS'
+            WHEN 'ATTENDANCE' THEN 'ATTENDANCE' WHEN 'LEAVE' THEN 'LEAVE'
+            WHEN 'ASSETS' THEN 'ASSETS' WHEN 'HELPDESK' THEN 'HELPDESK'
+            WHEN 'API' THEN 'API' WHEN 'APPPORTAL' THEN 'API' WHEN 'MARKETPLACEPRO' THEN 'API'
+            WHEN 'SHIFTGROUP' THEN 'SHIFTMGMT' WHEN 'SHIFTMANAGEMENT' THEN 'SHIFTMGMT'
+            WHEN 'AUTOSHIFTASSIGNMENT' THEN 'AUTOSHIFT'
+            WHEN 'SFTPAUTOMATION' THEN 'SFTP' WHEN 'SFTPINTEGRATION' THEN 'SFTP'
+            WHEN 'EXPENSECLAIM' THEN 'EXPENSE'
+            WHEN 'ONBOARDING&EXIT' THEN 'COREHR' WHEN 'ADVANCEDEMPLOYEEONBOARDING' THEN 'COREHR' WHEN 'PREBOARDING' THEN 'COREHR'
+            WHEN 'NOTIFICATIONENGINE' THEN 'NOTIFICATION'
+            WHEN 'DISTANCECALCULATOR' THEN 'DISTANCE'
+            WHEN 'ROLES&PERMISSIONS' THEN 'ROLES'
+            WHEN 'SURVEY(ENGAGE)' THEN 'SURVEY'
+            ELSE UPPER(REPLACE(REPLACE(REPLACE(TRIM(m.value::VARCHAR), ' ', ''), '-', ''), '/', ''))
+        END AS ADDON_ALIAS
+    FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+    JOIN KEKA_BRAIN.RAW.VW_HS_OS_TENANTS t ON q.SUBSCRIPTIONID = t.PROPERTY_SUBSCRIPTION_ID
+    JOIN KEKA_BRAIN.RAW.VW_HS_TENANTS_DEALS_ASSOCIATIONS tda ON t.OBJECTID = tda.TENANTS_OBJECTID AND NVL(tda.ISDELETED, FALSE) = FALSE
+    JOIN KEKA_BRAIN.RAW.HS_DEALS d ON tda.DEAL_OBJECTID = d.OBJECTID AND NVL(d.ISDELETED, FALSE) = FALSE,
+    LATERAL FLATTEN(input => SPLIT(d.PROPERTY_MODULES_INTERESTED_IN, ';')) m
+    WHERE q.QUOTETYPE = 2 AND NVL(q.ISDELETED, FALSE) = FALSE
+      AND d.PROPERTY_MODULES_INTERESTED_IN IS NOT NULL
+      AND TRIM(m.value::VARCHAR) != ''
+      AND UPPER(TRIM(m.value::VARCHAR)) != 'UNKNOWN'
+),
+upsell_module_matches AS (
+    SELECT DISTINCT qa.QUOTATIONID, rpm.PROJECT_ID
+    FROM upsell_quotation_addon_aliases qa
+    JOIN upsell_rl_project_modules rpm ON qa.ADDON_ALIAS = rpm.MODULE_ALIAS
+),
+upsell_match_exact_subdomain AS (
+    SELECT q.QUOTATIONID, rp.PROJECT_ID,
+        ROW_NUMBER() OVER (PARTITION BY q.QUOTATIONID ORDER BY
+            CASE WHEN rp.DUE_DATE_ACTUAL IS NOT NULL AND rp.DUE_DATE_ACTUAL != '' THEN 0 ELSE 1 END ASC,
+            rp.CREATED_AT ASC
+        ) AS qt_rn
+    FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+    JOIN (
+        SELECT SUBSCRIPTIONIDENTIFIER, MIN(SUBDOMAINNAME) AS SUBDOMAINNAME
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT
+        GROUP BY SUBSCRIPTIONIDENTIFIER
+    ) bst2 ON q.SUBSCRIPTIONID = bst2.SUBSCRIPTIONIDENTIFIER
+    JOIN upsell_rl_projects rp
+        ON rp.TYPE_OF_ACCOUNT = '2'
+        AND rp.SUBDOMAIN = bst2.SUBDOMAINNAME
+        AND q.ACKNOWLEDGEDON <= rp.CREATED_AT
+    JOIN upsell_module_matches mm ON mm.QUOTATIONID = q.QUOTATIONID AND mm.PROJECT_ID = rp.PROJECT_ID
+    WHERE q.QUOTETYPE = 2 AND NVL(q.ISDELETED, FALSE) = FALSE
+),
+upsell_match_exact_subdomain_deduped AS (
+    SELECT QUOTATIONID, PROJECT_ID, qt_rn
+    FROM (
+        SELECT mes.QUOTATIONID, mes.PROJECT_ID, mes.qt_rn,
+            ROW_NUMBER() OVER (PARTITION BY mes.PROJECT_ID ORDER BY q.ACKNOWLEDGEDON DESC NULLS LAST) AS proj_rn
+        FROM upsell_match_exact_subdomain mes
+        JOIN KEKA_BRAIN.RAW.OS_QUOTATION q ON mes.QUOTATIONID = q.QUOTATIONID
+    )
+    WHERE proj_rn = 1
+),
+upsell_match_exact_client AS (
+    SELECT q.QUOTATIONID, MIN(rp.PROJECT_ID) AS PROJECT_ID
+    FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+    JOIN (
+        SELECT SUBSCRIPTIONIDENTIFIER, MIN(SUBDOMAINNAME) AS SUBDOMAINNAME
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT
+        GROUP BY SUBSCRIPTIONIDENTIFIER
+    ) bst2 ON q.SUBSCRIPTIONID = bst2.SUBSCRIPTIONIDENTIFIER
+    JOIN (
+        SELECT SUBDOMAINNAME, MIN(CLIENT_CODE) AS CLIENT_CODE
+        FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+        GROUP BY SUBDOMAINNAME
+    ) org2 ON bst2.SUBDOMAINNAME = org2.SUBDOMAINNAME
+    JOIN upsell_rl_projects rp
+        ON rp.TYPE_OF_ACCOUNT = '2'
+        AND rp.CLIENT_CODE = org2.CLIENT_CODE
+        AND rp.CREATED_AT::DATE = q.ACKNOWLEDGEDON::DATE
+    LEFT JOIN upsell_match_exact_subdomain_deduped mes ON q.QUOTATIONID = mes.QUOTATIONID
+    WHERE q.QUOTETYPE = 2 AND NVL(q.ISDELETED, FALSE) = FALSE AND mes.QUOTATIONID IS NULL
+    GROUP BY q.QUOTATIONID
+),
+upsell_match_exact AS (
+    SELECT QUOTATIONID, PROJECT_ID, qt_rn FROM upsell_match_exact_subdomain_deduped
+    UNION ALL
+    SELECT QUOTATIONID, PROJECT_ID, 1 AS qt_rn FROM upsell_match_exact_client
+),
+upsell_match_module AS (
+    SELECT q.QUOTATIONID, MIN(rp.PROJECT_ID) AS PROJECT_ID
+    FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+    JOIN (
+        SELECT SUBSCRIPTIONIDENTIFIER, MIN(SUBDOMAINNAME) AS SUBDOMAINNAME
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT
+        GROUP BY SUBSCRIPTIONIDENTIFIER
+    ) bst3 ON q.SUBSCRIPTIONID = bst3.SUBSCRIPTIONIDENTIFIER
+    JOIN upsell_rl_projects rp
+        ON rp.TYPE_OF_ACCOUNT = '2'
+        AND rp.SUBDOMAIN = bst3.SUBDOMAINNAME
+        AND q.ACKNOWLEDGEDON <= rp.CREATED_AT
+    JOIN upsell_module_matches mm ON mm.QUOTATIONID = q.QUOTATIONID AND mm.PROJECT_ID = rp.PROJECT_ID
+    LEFT JOIN upsell_match_exact me ON q.QUOTATIONID = me.QUOTATIONID
+    WHERE q.QUOTETYPE = 2 AND NVL(q.ISDELETED, FALSE) = FALSE AND me.QUOTATIONID IS NULL
+    GROUP BY q.QUOTATIONID
+),
+upsell_final_match AS (
+    SELECT QUOTATIONID, PROJECT_ID, MATCH_TYPE,
+        ROW_NUMBER() OVER (
+            PARTITION BY PROJECT_ID
+            ORDER BY
+                CASE WHEN MATCH_TYPE = 'Exact Match' THEN 0 ELSE 1 END ASC,
+                ACKNOWLEDGEDON DESC NULLS LAST
+        ) AS qt_rn,
+        ACKNOWLEDGEDON
+    FROM (
+        SELECT me.QUOTATIONID, me.PROJECT_ID, 'Exact Match' AS MATCH_TYPE, q.ACKNOWLEDGEDON
+        FROM upsell_match_exact me
+        JOIN KEKA_BRAIN.RAW.OS_QUOTATION q ON me.QUOTATIONID = q.QUOTATIONID
+        UNION ALL
+        SELECT mm.QUOTATIONID, mm.PROJECT_ID, 'Module Match' AS MATCH_TYPE, q.ACKNOWLEDGEDON
+        FROM upsell_match_module mm
+        JOIN KEKA_BRAIN.RAW.OS_QUOTATION q ON mm.QUOTATIONID = q.QUOTATIONID
+    )
+),
+upsell_hs_deal_map AS (
+    SELECT QUOTATIONID, HS_DEAL_ID, HS_DEAL_NAME, HS_DEAL_STAGE, HS_CLOSE_DATE, HS_DEAL_AMOUNT, HS_MODULES_INTERESTED
+    FROM (
+        SELECT
+            q.QUOTATIONID,
+            d.OBJECTID                                  AS HS_DEAL_ID,
+            d.PROPERTY_DEALNAME                         AS HS_DEAL_NAME,
+            d.PROPERTY_DEALSTAGE                        AS HS_DEAL_STAGE,
+            d.PROPERTY_CLOSEDATE                        AS HS_CLOSE_DATE,
+            d.PROPERTY_AMOUNT_IN_HOME_CURRENCY          AS HS_DEAL_AMOUNT,
+            d.PROPERTY_MODULES_INTERESTED_IN            AS HS_MODULES_INTERESTED,
+            ROW_NUMBER() OVER (PARTITION BY q.QUOTATIONID ORDER BY
+                CASE WHEN d.PROPERTY_AMOUNT_IN_HOME_CURRENCY IS NOT NULL
+                     AND ABS(NVL(d.PROPERTY_AMOUNT_IN_HOME_CURRENCY, 0) - q.MRR) < 1 THEN 0 ELSE 1 END ASC,
+                ABS(DATEDIFF('day', q.ACKNOWLEDGEDON, d.PROPERTY_CLOSEDATE)) ASC NULLS LAST,
+                d.PROPERTY_CLOSEDATE DESC NULLS LAST
+            ) AS rn
+        FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+        JOIN KEKA_BRAIN.RAW.VW_HS_OS_TENANTS t
+            ON q.SUBSCRIPTIONID = t.PROPERTY_SUBSCRIPTION_ID
+        JOIN KEKA_BRAIN.RAW.VW_HS_TENANTS_DEALS_ASSOCIATIONS tda
+            ON t.OBJECTID = tda.TENANTS_OBJECTID AND NVL(tda.ISDELETED, FALSE) = FALSE
+        JOIN KEKA_BRAIN.RAW.HS_DEALS d
+            ON tda.DEAL_OBJECTID = d.OBJECTID AND NVL(d.ISDELETED, FALSE) = FALSE
+        WHERE q.QUOTETYPE = 2 AND NVL(q.ISDELETED, FALSE) = FALSE
+    )
+    WHERE rn = 1
+),
+os_upsell AS (
+    SELECT
+        q.QUOTATIONNUMBER                              AS DEAL_ID,
+        q.QUOTATIONID,
+        hs.HS_DEAL_ID                                  AS HUBSPOT_DEAL_ID,
+        hs.HS_DEAL_NAME                                AS HUBSPOT_DEAL_NAME,
+        hs.HS_DEAL_STAGE                               AS HUBSPOT_DEAL_STAGE,
+        hs.HS_CLOSE_DATE::DATE                          AS HUBSPOT_CLOSE_DATE,
+        hs.HS_MODULES_INTERESTED                       AS HUBSPOT_MODULES_INTERESTED,
+        q.MRR,
+        q.ADDEDON::DATE                                 AS ADDED_ON_DATE,
+        q.SUBSCRIPTIONID                                AS SUBSCRIPTION_ID,
+        q.SUBSCRIPTIONNAME                              AS SUBSCRIPTION_NAME,
+        bst.SUBDOMAINNAME                               AS SUBDOMAIN_NAME,
+        org.CLIENT_CODE,
+        ba.NAME                                         AS BILLING_ACCOUNT_NAME,
+        PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR    AS CURRENCY,
+        CASE
+            WHEN fm.qt_rn = 1 AND PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR = 'INR' THEN ROUND(q.MRR / 89.0, 2)
+            WHEN fm.qt_rn = 1 THEN q.MRR
+            ELSE 0
+        END                                             AS MRR_USD,
+        CASE
+            WHEN fm.qt_rn = 1 AND PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR = 'INR' THEN ROUND((q.MRR / 89.0) * 12, 2)
+            WHEN fm.qt_rn = 1 AND PARSE_JSON(ba.BILLINGCURRENCY):Code::VARCHAR = 'USD' THEN q.MRR * 12
+            WHEN fm.qt_rn = 1 THEN q.MRR * 12
+            ELSE 0
+        END                                             AS ARR_USD,
+        m.NAME                                          AS CUSTOMER_MARKET,
+        addons.ADDON_LIST                               AS ADDONS,
+        rp_final.PROJECT_ID                             AS RL_PROJECT_ID,
+        CASE rp_final.TYPE_OF_ACCOUNT
+            WHEN '1' THEN 'Full Account'
+            WHEN '2' THEN 'Add On Account'
+            WHEN '3' THEN 'Migration Account'
+            WHEN '4' THEN 'Reconfiguration Account'
+        END                                             AS RL_TYPE_OF_ACCOUNT,
+        rp_final.CREATED_AT::DATE                       AS RL_CREATED_DATE,
+        rp_final.PROJECT_OWNER_NAME                     AS RL_PROJECT_OWNER,
+        TO_VARCHAR(DATEADD(DAY, TRY_CAST(rp_final.DUE_DATE_ACTUAL AS INT), '1970-01-01'::DATE), 'DD-MON-YY') AS RL_ACTUAL_COMPLETED_DATE,
+        rp_final.PROJECT_NAME                            AS RL_PROJECT_NAME,
+        DATEADD(DAY, DATE_PART(epoch_second, rp_final.DUE_DATE) - 19800, '1970-01-01'::DATE) AS RL_DUE_DATE,
+        CASE rp_final.STATUS_CODE
+            WHEN 2 THEN 'In Progress'
+            WHEN 3 THEN 'Completed'
+            WHEN 4 THEN 'Blocked'
+            WHEN 5 THEN 'Proposed'
+            WHEN 6 THEN 'In Planning'
+            WHEN 7 THEN 'To be Staffed'
+            WHEN 8 THEN 'Cancelled'
+            WHEN 9 THEN 'On Hold'
+            WHEN 10 THEN 'In Progress - SOW'
+            WHEN 11 THEN 'In Progress - Setup'
+            WHEN 12 THEN 'In Progress - Sign off'
+            WHEN 13 THEN 'In Progress - Kick Off'
+            WHEN 14 THEN 'On Hold - SOW'
+            WHEN 15 THEN 'On Hold - Setup'
+            WHEN 16 THEN 'On Hold - Kick off'
+            WHEN 17 THEN 'On Hold - Sign off'
+            ELSE 'Unknown'
+        END                                              AS RL_PROJECT_STATUS,
+        rp_final.CANCELLED_DATE                         AS RL_CANCELLED_DATE,
+        CASE rp_final.CANCEL_REASON_ID
+            WHEN '1' THEN 'Taken up By CSM'
+            WHEN '2' THEN 'Duplicate Project'
+            WHEN '3' THEN 'Add-on - covered in original project'
+            WHEN '4' THEN 'Customer discontinued'
+            WHEN '5' THEN 'Customer Readiness'
+            WHEN '6' THEN 'BGC declined by payment partner- US'
+        END                                             AS RL_CANCELATION_PRIMARY_REASON,
+        CASE
+            WHEN rp_final.DUE_DATE_ACTUAL IS NOT NULL AND rp_final.DUE_DATE_ACTUAL != '' THEN 'OB Addon Team'
+            WHEN rp_final.CANCELLED_DATE IS NOT NULL AND rp_final.CANCEL_REASON_ID = '1' THEN 'CSM Completed Addon'
+        END                                             AS COMPLETED_BY,
+        fm.MATCH_TYPE                                   AS RL_MATCH_TYPE,
+        CASE WHEN fm.qt_rn = 1 THEN 'Primary' ELSE 'Duplicate' END AS DEAL_ATTRIBUTION,
+        q.STATUS                                        AS QUOTE_STATUS,
+        q.ACKNOWLEDGEDON::DATE                          AS ACKNOWLEDGEDON,
+        q.ACKNOWLEDGEDBY
+    FROM KEKA_BRAIN.RAW.OS_QUOTATION q
+    LEFT JOIN (
+        SELECT SUBSCRIPTIONIDENTIFIER, MIN(SUBDOMAINNAME) AS SUBDOMAINNAME
+        FROM KEKA_BRAIN.RAW.OS_BIZ_BILLINGSUBSCRIPTIONTENANT
+        GROUP BY SUBSCRIPTIONIDENTIFIER
+    ) bst ON q.SUBSCRIPTIONID = bst.SUBSCRIPTIONIDENTIFIER
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_BILLINGACCOUNT ba
+        ON q.BILLINGACCOUNTIDENTIFIER = ba.BILLINGACCOUNTID
+        AND NVL(ba.ISDELETED, FALSE) = FALSE
+    LEFT JOIN KEKA_BRAIN.RAW.OS_BIZ_MARKET m
+        ON ba.MARKETID = m.ID
+    LEFT JOIN (
+        SELECT SUBDOMAINNAME, MIN(CLIENT_CODE) AS CLIENT_CODE
+        FROM KEKA_BRAIN.RAW.VW_ORGDETAILS
+        GROUP BY SUBDOMAINNAME
+    ) org ON bst.SUBDOMAINNAME = org.SUBDOMAINNAME
+    LEFT JOIN (
+        SELECT qi.QUOTATIONID,
+            LISTAGG(DISTINCT feat.value:MarketableFeatureTitle::VARCHAR, ', ')
+                WITHIN GROUP (ORDER BY feat.value:MarketableFeatureTitle::VARCHAR) AS ADDON_LIST
+        FROM KEKA_BRAIN.RAW.OS_QUOTATION qi,
+            LATERAL FLATTEN(input => PARSE_JSON(qi.QUOTEITEMS):SubscriptionBundlePlans) bp,
+            LATERAL FLATTEN(input => bp.value:PlanPackages) pkg,
+            LATERAL FLATTEN(input => pkg.value:MarketableFeatures) feat
+        WHERE qi.QUOTETYPE = 2 AND NVL(qi.ISDELETED, FALSE) = FALSE AND pkg.value:IsAddon::BOOLEAN = TRUE
+        GROUP BY qi.QUOTATIONID
+    ) addons ON q.QUOTATIONID = addons.QUOTATIONID
+    LEFT JOIN upsell_final_match fm ON q.QUOTATIONID = fm.QUOTATIONID
+    LEFT JOIN upsell_rl_projects rp_final ON fm.PROJECT_ID = rp_final.PROJECT_ID
+    LEFT JOIN upsell_hs_deal_map hs ON q.QUOTATIONID = hs.QUOTATIONID
+    WHERE q.QUOTETYPE = 2
+      AND NVL(q.ISDELETED, FALSE) = FALSE
+      AND q.MRR >= 0
+),
+subdomain_mrr_lookup AS (
+    -- Per-subdomain fallback: pick MRR from a sibling project that has a SUBSCRIPTION_ID
+    -- so that no-subscription full-account projects can inherit MRR from the same subdomain.
+    SELECT SUBDOMAIN_KEY, SIBLING_MRR_FULL_ACCOUNT, SIBLING_SUBSCRIPTION_ID, SIBLING_PROJECT_ID
+    FROM (
+        SELECT
+            LOWER(TRIM(s3.SUBDOMAIN_NAME)) AS SUBDOMAIN_KEY,
+            s3.MRR_FULL_ACCOUNT          AS SIBLING_MRR_FULL_ACCOUNT,
+            COALESCE(s3.SUBSCRIPTION_ID_RESOLVED, s3.SUBSCRIPTION_ID) AS SIBLING_SUBSCRIPTION_ID,
+            s3.PROJECT_ID                AS SIBLING_PROJECT_ID,
+            ROW_NUMBER() OVER (
+                PARTITION BY LOWER(TRIM(s3.SUBDOMAIN_NAME))
+                ORDER BY s3.ACTUAL_COMPLETED_DATE DESC NULLS LAST,
+                         s3.PROJECT_ID DESC
+            ) AS RN
+        FROM step3_enrichment s3
+        WHERE s3.SUBDOMAIN_NAME IS NOT NULL
+          AND TRIM(s3.SUBDOMAIN_NAME) <> ''
+          AND COALESCE(s3.SUBSCRIPTION_ID_RESOLVED, s3.SUBSCRIPTION_ID) IS NOT NULL
+          AND s3.MRR_FULL_ACCOUNT IS NOT NULL
+    )
+    WHERE RN = 1
+),
+final_enriched AS (
+SELECT
+    s3.PROJECT_ID,
+    s3.PROJECT_NAME,
+    s3.DUE_DATE,
+    s3.PROJECT_OWNER,
+    s3.ACTUAL_COMPLETED_DATE,
+    s3.ACTUAL_START_DATE,
+    s3.FIRST_GO_LIVE_DATE,
+    s3.DAYS_IN_IMPLEMENTATION_STAGE,
+    s3.DAYS_IN_SOLUTIONING_STAGE,
+    s3.DURATION_ON_HOLD_KICKOFF,
+    s3.DURATION_ON_HOLD_SETUP,
+    s3.DURATION_ON_HOLD_SOW,
+    s3.DURATION_ON_HOLD_SIGNOFF,
+    s3.ON_HOLD_TOTAL_DURATION,
+    s3.ON_HOLD_PRIMARY_REASON,
+    s3.ON_HOLD_REQUEST_STATUS,
+    s3.ON_HOLD_STATUS_APPROVED_COUNT,
+    s3.PROJECT_AGE,
+    s3.CREATED_ON,
+    s3.CANCELLED_DATE,
+    s3.ON_HOLD_DATE,
+    s3.CUSTOMER_NAME,
+    COALESCE(NULLIF(TRIM(s3.SUBDOMAIN_NAME), ''), s3.SUBDOMAIN_NAME_RESOLVED) AS SUBDOMAIN_NAME,
+    COALESCE(s3.SUBSCRIPTION_ID_RESOLVED, s3.SUBSCRIPTION_ID) AS SUBSCRIPTION_ID,
+    s3.SUBSCRIPTION_ID_MATCH_FOUND,
+    COALESCE(s3.CLIENT_ID_RESOLVED, s3.CLIENT_ID) AS CLIENT_ID,
+    s3.CUSTOMER_SEGMENT,
+    s3.EMPLOYEE_COUNT,
+    s3.TYPE_OF_ACCOUNT,
+    s3.SUBSCRIPTION_PLAN,
+    s3.TENANT_CREATED_ON,
+    s3.CSM_NAME,
+    s3.SOLUTION_POC,
+    s3.PARTNER_ACCOUNT,
+    s3.PARTNER_NAME,
+    s3.PARTNER_ONB_ENG,
+    s3.ONBOARDING_ENGINEER,
+    s3.FEATURE,
+    s3.MODULE,
+    s3.CURRENCY,
+    s3.MARKET,
+    s3.TENANT_STATUS,
+    s3.PAYMENT_DATE,
+    s3.PROJECT_AGE_SEGMENT,
+    s3.CSAT_RATING,
+    s3.SOLUTIONING_CSAT,
+    s3.PROJECT_STATUS,
+    s3.BILLING_ACCOUNT_NAME,
+    s3.OS_OB_COMPLETION_DATE,
+    COALESCE(s3.MRR_FULL_ACCOUNT, sml.SIBLING_MRR_FULL_ACCOUNT) AS MRR_FULL_ACCOUNT,
+    CASE
+        WHEN s3.MRR_FULL_ACCOUNT IS NOT NULL THEN 'OWN_SUBSCRIPTION'
+        WHEN sml.SIBLING_MRR_FULL_ACCOUNT IS NOT NULL THEN 'COPIED_FROM_SUBDOMAIN_SIBLING'
+        ELSE NULL
+    END AS MRR_FULL_ACCOUNT_SOURCE,
+    sml.SIBLING_PROJECT_ID      AS MRR_SOURCE_PROJECT_ID,
+    sml.SIBLING_SUBSCRIPTION_ID AS MRR_SOURCE_SUBSCRIPTION_ID,
+    up.DEAL_ID AS UPSELL_DEAL_ID,
+    up.QUOTATIONID AS UPSELL_QUOTATION_ID,
+    up.HUBSPOT_DEAL_ID AS UPSELL_HUBSPOT_DEAL_ID,
+    up.HUBSPOT_DEAL_NAME AS UPSELL_HUBSPOT_DEAL_NAME,
+    up.HUBSPOT_DEAL_STAGE AS UPSELL_HUBSPOT_DEAL_STAGE,
+    up.HUBSPOT_CLOSE_DATE AS UPSELL_HUBSPOT_CLOSE_DATE,
+    up.HUBSPOT_MODULES_INTERESTED AS UPSELL_MODULES_INTERESTED,
+    up.MRR AS UPSELL_MRR,
+    up.ADDED_ON_DATE AS UPSELL_ADDED_ON_DATE,
+    up.SUBSCRIPTION_ID AS UPSELL_SUBSCRIPTION_ID,
+    up.SUBSCRIPTION_NAME AS UPSELL_SUBSCRIPTION_NAME,
+    up.SUBDOMAIN_NAME AS UPSELL_SUBDOMAIN_NAME,
+    up.CLIENT_CODE AS UPSELL_CLIENT_CODE,
+    up.BILLING_ACCOUNT_NAME AS UPSELL_BILLING_ACCOUNT_NAME,
+    up.CURRENCY AS UPSELL_CURRENCY,
+    up.MRR_USD AS UPSELL_MRR_USD,
+    up.ARR_USD AS UPSELL_ARR_USD,
+    up.CUSTOMER_MARKET AS UPSELL_CUSTOMER_MARKET,
+    up.ADDONS AS UPSELL_ADDONS,
+    up.RL_TYPE_OF_ACCOUNT AS UPSELL_RL_TYPE_OF_ACCOUNT,
+    up.RL_CREATED_DATE AS UPSELL_RL_CREATED_DATE,
+    up.RL_PROJECT_OWNER AS UPSELL_RL_PROJECT_OWNER,
+    up.RL_ACTUAL_COMPLETED_DATE AS UPSELL_RL_ACTUAL_COMPLETED_DATE,
+    up.RL_PROJECT_NAME AS UPSELL_RL_PROJECT_NAME,
+    up.RL_DUE_DATE AS UPSELL_RL_DUE_DATE,
+    up.RL_PROJECT_STATUS AS UPSELL_RL_PROJECT_STATUS,
+    up.RL_CANCELLED_DATE AS UPSELL_RL_CANCELLED_DATE,
+    up.RL_CANCELATION_PRIMARY_REASON AS UPSELL_RL_CANCEL_REASON,
+    up.COMPLETED_BY AS UPSELL_COMPLETED_BY,
+    up.RL_MATCH_TYPE AS UPSELL_MATCH_TYPE,
+    up.DEAL_ATTRIBUTION AS UPSELL_DEAL_ATTRIBUTION,
+    up.QUOTE_STATUS AS UPSELL_QUOTE_STATUS,
+    up.ACKNOWLEDGEDON AS UPSELL_ACKNOWLEDGED_ON,
+    up.ACKNOWLEDGEDBY AS UPSELL_ACKNOWLEDGED_BY
+FROM step3_enrichment s3
+LEFT JOIN subdomain_mrr_lookup sml
+    ON LOWER(TRIM(s3.SUBDOMAIN_NAME)) = sml.SUBDOMAIN_KEY
+LEFT JOIN (
+    SELECT *
+    FROM (
+        SELECT up2.*, ROW_NUMBER() OVER (PARTITION BY up2.RL_PROJECT_ID ORDER BY up2.ACKNOWLEDGEDON DESC NULLS LAST) AS UP_RN
+        FROM os_upsell up2
+        WHERE up2.RL_PROJECT_ID IS NOT NULL
+    )
+    WHERE UP_RN = 1
+) up ON s3.PROJECT_ID = up.RL_PROJECT_ID
+),
+with_primary AS (
+SELECT
+    fe.*,
+    CASE
+        WHEN (fe.PROJECT_STATUS = 'Cancelled' AND fe.CANCELLED_DATE IS NULL)
+          OR (fe.PROJECT_STATUS = 'Completed' AND fe.ACTUAL_COMPLETED_DATE IS NULL)
+            THEN NULL
+        WHEN fe.TYPE_OF_ACCOUNT = 'Full Account - Sales' AND fe.PROJECT_STATUS = 'Cancelled'
+             AND EXISTS (
+                 SELECT 1 FROM final_enriched fe2
+                 WHERE fe2.TYPE_OF_ACCOUNT = 'Full Account - Sales'
+                   AND fe2.PROJECT_STATUS != 'Cancelled'
+                   AND COALESCE(fe2.CLIENT_ID, UPPER(TRIM(fe2.CUSTOMER_NAME))) = COALESCE(fe.CLIENT_ID, UPPER(TRIM(fe.CUSTOMER_NAME)))
+                   AND LOWER(TRIM(fe2.SUBDOMAIN_NAME)) = LOWER(TRIM(fe.SUBDOMAIN_NAME))
+                   AND fe2.PROJECT_ID != fe.PROJECT_ID
+             ) THEN NULL
+        WHEN fe.TYPE_OF_ACCOUNT = 'Full Account - Sales' AND fe.PROJECT_STATUS = 'Cancelled' THEN 'Primary Full Account'
+        WHEN fe.TYPE_OF_ACCOUNT = 'Full Account - Sales' THEN
+            CASE WHEN ROW_NUMBER() OVER (
+                    PARTITION BY
+                        COALESCE(fe.CLIENT_ID, UPPER(TRIM(fe.CUSTOMER_NAME))),
+                        LOWER(TRIM(fe.SUBDOMAIN_NAME)),
+                        fe.TYPE_OF_ACCOUNT
+                    ORDER BY
+                        CASE WHEN fe.PROJECT_STATUS = 'Cancelled' THEN 1 ELSE 0 END ASC,
+                        fe.ACTUAL_COMPLETED_DATE ASC NULLS LAST,
+                        fe.PROJECT_ID ASC
+                 ) = 1
+                THEN 'Primary Full Account'
+            ELSE 'Secondary Full Account' END
+    END AS "Primary Full Account?"
+FROM final_enriched fe
+)
+SELECT
+    wp.*,
+    CASE
+        WHEN wp."Primary Full Account?" = 'Primary Full Account'
+             AND wp.MRR_FULL_ACCOUNT IS NOT NULL THEN
+            CASE UPPER(TRIM(wp.CURRENCY))
+                WHEN 'USD' THEN wp.MRR_FULL_ACCOUNT * 12
+                WHEN 'INR' THEN wp.MRR_FULL_ACCOUNT * 12 / 89
+            END
+    END AS "ARR_Full (USD)",
+    CASE
+        WHEN (CASE
+                WHEN wp."Primary Full Account?" = 'Primary Full Account'
+                     AND wp.MRR_FULL_ACCOUNT IS NOT NULL THEN
+                    CASE UPPER(TRIM(wp.CURRENCY))
+                        WHEN 'USD' THEN wp.MRR_FULL_ACCOUNT * 12
+                        WHEN 'INR' THEN wp.MRR_FULL_ACCOUNT * 12 / 89
+                    END
+              END) IS NOT NULL
+             AND wp.UPSELL_ARR_USD IS NOT NULL
+             AND wp.UPSELL_DEAL_ATTRIBUTION = 'Primary' THEN 'check'
+        WHEN wp.UPSELL_ARR_USD IS NOT NULL
+             AND wp.UPSELL_DEAL_ATTRIBUTION = 'Primary' THEN TO_VARCHAR(wp.UPSELL_ARR_USD)
+        WHEN wp."Primary Full Account?" = 'Primary Full Account'
+             AND wp.MRR_FULL_ACCOUNT IS NOT NULL THEN
+            TO_VARCHAR(
+                CASE UPPER(TRIM(wp.CURRENCY))
+                    WHEN 'USD' THEN wp.MRR_FULL_ACCOUNT * 12
+                    WHEN 'INR' THEN wp.MRR_FULL_ACCOUNT * 12 / 89
+                END
+            )
+    END AS "ARR_USD (Final)"
+FROM with_primary wp
+WHERE UPPER(TRIM(COALESCE(wp.CUSTOMER_NAME, ''))) NOT IN ('DEV TESTING ACCOUNT', 'DEV TESTING US')
+  AND UPPER(REPLACE(TRIM(COALESCE(wp.PROJECT_OWNER, '')), ' ', '')) NOT IN (
+        'CSOPS', 'INTEGRATIONGTM', 'INTEGRATIONSGTM', 'ROCKETLANECOACH', 'RLCOACH',
+        'SUBHAJITDAS', 'SUBHAJITD'
+  );
